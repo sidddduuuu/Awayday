@@ -2,9 +2,11 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
+  ActionSchema,
   DisruptionSchema,
   ItinerarySchema,
   MissionSchema,
+  type Action,
   type Disruption,
   type Itinerary,
   type Mission,
@@ -26,6 +28,11 @@ export interface DisruptionRecord {
   missionId: string;
   disruption: Disruption;
   createdAt: string;
+}
+
+export interface ActionRecord {
+  action: Action;
+  updatedAt: string;
 }
 
 const globals = globalThis as typeof globalThis & {
@@ -65,6 +72,14 @@ export function openMissionDatabase(path: string) {
       id TEXT NOT NULL,
       payload TEXT NOT NULL CHECK (json_valid(payload)),
       created_at TEXT NOT NULL,
+      PRIMARY KEY (mission_id, id)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS actions (
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      id TEXT NOT NULL,
+      payload TEXT NOT NULL CHECK (json_valid(payload)),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
       PRIMARY KEY (mission_id, id)
     ) STRICT;
   `);
@@ -194,6 +209,73 @@ export function saveDisruption(
   const record = findDisruption(database, missionId, disruption.id);
   if (!record) throw new Error("Saved disruption could not be read");
   return { record, created: Number(result.changes) === 1 };
+}
+
+function actionRecord(row: Record<string, unknown>): ActionRecord {
+  if (
+    typeof row.payload !== "string"
+    || typeof row.created_at !== "string"
+    || typeof row.updated_at !== "string"
+  ) {
+    throw new Error("Stored action row has an invalid shape");
+  }
+  const action = ActionSchema.parse(JSON.parse(row.payload));
+  if (action.createdAt !== row.created_at) throw new Error("Stored action timestamps do not match");
+  return { action, updatedAt: row.updated_at };
+}
+
+export function findAction(database: DatabaseSync, missionId: string, actionId: string): ActionRecord | null {
+  const row = database.prepare(`
+    SELECT payload, created_at, updated_at
+    FROM actions
+    WHERE mission_id = ? AND id = ?
+  `).get(missionId, actionId);
+  return row ? actionRecord(row) : null;
+}
+
+export function listActions(database: DatabaseSync, missionId: string): ActionRecord[] {
+  return database.prepare(`
+    SELECT payload, created_at, updated_at
+    FROM actions
+    WHERE mission_id = ?
+    ORDER BY created_at, id
+  `).all(missionId).map(actionRecord);
+}
+
+export function saveAction(database: DatabaseSync, action: Action, now = new Date()): ActionRecord {
+  const updatedAt = now.toISOString();
+  database.prepare(`
+    INSERT INTO actions (mission_id, id, payload, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(action.missionId, action.id, JSON.stringify(action), action.createdAt, updatedAt);
+  const saved = findAction(database, action.missionId, action.id);
+  if (!saved) throw new Error("Saved action could not be read");
+  return saved;
+}
+
+export function transitionActionStatus(
+  database: DatabaseSync,
+  missionId: string,
+  actionId: string,
+  from: Action["status"],
+  to: Action["status"],
+  now = new Date(),
+) {
+  const current = findAction(database, missionId, actionId);
+  if (!current) return { outcome: "not_found" as const };
+  if (current.action.status !== from) return { outcome: "conflict" as const, record: current };
+  const next = ActionSchema.parse({ ...current.action, status: to });
+  const updatedAt = now.toISOString();
+  const result = database.prepare(`
+    UPDATE actions
+    SET payload = ?, updated_at = ?
+    WHERE mission_id = ? AND id = ? AND json_extract(payload, '$.status') = ?
+  `).run(JSON.stringify(next), updatedAt, missionId, actionId, from);
+  if (Number(result.changes) !== 1) {
+    const record = findAction(database, missionId, actionId);
+    return { outcome: "conflict" as const, record };
+  }
+  return { outcome: "updated" as const, record: { action: next, updatedAt } };
 }
 
 export function databaseIsHealthy(database: DatabaseSync) {

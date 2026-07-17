@@ -138,17 +138,29 @@ export const DisruptionSchema = z.strictObject({
   ]),
 });
 
+const ActionInputFields = {
+  kind: z.enum(["reroute", "reschedule", "rebook", "notify"]),
+  affectedLegIds: z.array(ResourceIdSchema).min(1).max(100),
+  costDeltaCents: z.number().int().min(-MAX_CENTS).max(MAX_CENTS),
+  explanation: z.string().trim().min(1).max(1_000),
+};
+
+function validateActionLegs(action: { affectedLegIds: string[] }, context: z.RefinementCtx) {
+  if (!unique(action.affectedLegIds)) {
+    context.addIssue({ code: "custom", message: "Affected leg IDs must be unique", path: ["affectedLegIds"] });
+  }
+}
+
+export const CreateActionSchema = z.strictObject(ActionInputFields).superRefine(validateActionLegs);
+
 export const ActionSchema = z.strictObject({
   id: ResourceIdSchema,
   missionId: ResourceIdSchema,
-  kind: z.enum(["reroute", "reschedule", "rebook", "notify"]),
+  ...ActionInputFields,
   status: z.enum(["proposed", "needs_approval", "approved", "executing", "succeeded", "failed", "rejected"]),
-  affectedLegIds: z.array(ResourceIdSchema).min(1).max(100),
-  costDeltaCents: z.number().int().min(-MAX_CENTS).max(MAX_CENTS),
   requiresApproval: z.boolean(),
-  explanation: z.string().trim().min(1).max(1_000),
   createdAt: TimestampSchema,
-});
+}).superRefine(validateActionLegs);
 
 export const ReadinessInputSchema = z
   .strictObject({
@@ -186,4 +198,5 @@ export type ItineraryLeg = z.infer<typeof ItineraryLegSchema>;
 export type Itinerary = z.infer<typeof ItinerarySchema>;
 export type Disruption = z.infer<typeof DisruptionSchema>;
 export type Action = z.infer<typeof ActionSchema>;
+export type CreateAction = z.infer<typeof CreateActionSchema>;
 export type ReadinessInput = z.infer<typeof ReadinessInputSchema>;

@@ -199,6 +199,14 @@ Use a temporary session token for development. Create a scoped service key only 
 
 Awayday receives normalized Nexla records at `POST /api/integrations/nexla/disruptions`. Configure a Universal REST API destination to send `missionId`, `id`, `legId`, `reportedAt`, and `impact`, with `X-Awayday-Ingest-Key` set to the same 32-byte-or-longer `NEXLA_INGEST_KEY` stored in the deployment environment. Nexla must be able to reach the deployed Akash route.
 
+### Action approvals
+
+`POST /api/missions/:id/actions` accepts an action kind, affected leg IDs, cost change, and explanation. Awayday assigns the identity and timestamps, verifies the legs, and compares added cost with the mission budget and every affected traveler's approval limit. Compliant actions become `approved`; actions outside that mandate become `needs_approval`.
+
+Use `GET /api/missions/:id/actions` for the activity list and `POST /api/missions/:id/actions/:actionId/decision` with `{"decision":"approve"}` or `{"decision":"reject"}` for a one-time decision. This layer records approval only; it does not invoke Zero or make an external purchase.
+
+The current same-origin check is not authentication. Before exposing mission or approval routes publicly, protect `/api/missions/**` with Pomerium identity and authorization; keep the separately keyed Nexla ingestion route available to Nexla.
+
 ### Pomerium
 
 ```bash

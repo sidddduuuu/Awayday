@@ -5,24 +5,36 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GET as health } from "../../app/api/health/route.ts";
 import { POST as ingestNexlaDisruption } from "../../app/api/integrations/nexla/disruptions/route.ts";
+import { GET as getActions, POST as createAction } from "../../app/api/missions/[id]/actions/route.ts";
+import { POST as decideAction } from "../../app/api/missions/[id]/actions/[actionId]/decision/route.ts";
 import { GET as getDisruptions, POST as createDisruption } from "../../app/api/missions/[id]/disruptions/route.ts";
 import { GET as getItinerary, PUT as putItinerary } from "../../app/api/missions/[id]/itinerary/route.ts";
 import { GET as getMission } from "../../app/api/missions/[id]/route.ts";
 import { POST as createMission } from "../../app/api/missions/route.ts";
 import {
   findItinerary,
+  listActions,
   listDisruptions,
   findMission,
   openMissionDatabase,
+  saveAction,
   saveDisruption,
   saveItinerary,
   saveMission,
   type DisruptionRecord,
+  type ActionRecord,
   type ItineraryRecord,
   type MissionRecord,
 } from "./store.ts";
 import type { ReadinessResult } from "../trips/readiness.ts";
-import { MissionSchema, type CreateMission, type Disruption, type Itinerary } from "../trips/schemas.ts";
+import {
+  ActionSchema,
+  MissionSchema,
+  type CreateAction,
+  type CreateMission,
+  type Disruption,
+  type Itinerary,
+} from "../trips/schemas.ts";
 
 process.env.AWAYDAY_DATABASE_PATH = ":memory:";
 
@@ -79,6 +91,15 @@ function disruptionInput(id = "delay-1", legId = "airport-to-event"): Disruption
   };
 }
 
+function actionInput(costDeltaCents = 5_000): CreateAction {
+  return {
+    kind: "rebook",
+    affectedLegIds: ["airport-to-event"],
+    costDeltaCents,
+    explanation: "Replace the delayed transfer with an available alternative",
+  };
+}
+
 function request(body: string, ip: string, origin = "http://localhost") {
   return new Request("http://localhost/api/missions", {
     method: "POST",
@@ -115,6 +136,22 @@ function nexlaRequest(body: string, key: string, ip: string) {
   });
 }
 
+function actionRequest(missionId: string, body: string, ip: string) {
+  return new Request(`http://localhost/api/missions/${missionId}/actions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "http://localhost", "x-forwarded-for": ip },
+    body,
+  });
+}
+
+function decisionRequest(missionId: string, actionId: string, decision: "approve" | "reject", ip: string) {
+  return new Request(`http://localhost/api/missions/${missionId}/actions/${actionId}/decision`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "http://localhost", "x-forwarded-for": ip },
+    body: JSON.stringify({ decision }),
+  });
+}
+
 type ItineraryResponse = {
   data: { itinerary: ItineraryRecord; readiness: ReadinessResult };
 };
@@ -126,6 +163,8 @@ type DisruptionResponse = {
 type DisruptionsResponse = {
   data: { disruptions: DisruptionRecord[]; readiness: ReadinessResult };
 };
+
+type ActionsResponse = { data: { actions: ActionRecord[] } };
 
 async function payload<T>(response: Response) {
   return (await response.json()) as T;
@@ -148,17 +187,27 @@ describe("mission persistence", () => {
     const path = join(directory, "missions.db");
     const mission = MissionSchema.parse({ id: "persisted-mission", ...missionInput() });
     const disruption = disruptionInput("persisted-delay");
+    const action = ActionSchema.parse({
+      id: "persisted-action",
+      missionId: mission.id,
+      ...actionInput(),
+      status: "approved",
+      requiresApproval: false,
+      createdAt: "2030-01-01T00:03:00.000Z",
+    });
     try {
       const first = openMissionDatabase(path);
       saveMission(first, mission, new Date("2030-01-01T00:00:00Z"));
       saveItinerary(first, mission.id, itineraryInput(), new Date("2030-01-01T00:01:00Z"));
       saveDisruption(first, mission.id, disruption, new Date("2030-01-01T00:02:00Z"));
+      saveAction(first, action, new Date("2030-01-01T00:03:00Z"));
       first.close();
 
       const second = openMissionDatabase(path);
       const stored = findMission(second, mission.id);
       const storedItinerary = findItinerary(second, mission.id);
       const storedDisruptions = listDisruptions(second, mission.id);
+      const storedActions = listActions(second, mission.id);
       second.close();
 
       assert.deepEqual(stored?.mission, mission);
@@ -166,6 +215,7 @@ describe("mission persistence", () => {
       assert.deepEqual(storedItinerary?.legs, itineraryInput().legs);
       assert.equal(storedItinerary?.createdAt, "2030-01-01T00:01:00.000Z");
       assert.deepEqual(storedDisruptions.map(({ disruption: item }) => item), [disruption]);
+      assert.deepEqual(storedActions.map(({ action: item }) => item), [action]);
       assert.equal(statSync(path).mode & 0o777, 0o600);
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -360,6 +410,92 @@ describe("mission API", () => {
       if (previous === undefined) delete process.env.NEXLA_INGEST_KEY;
       else process.env.NEXLA_INGEST_KEY = previous;
     }
+  });
+
+  it("creates server-controlled actions and lists them", async () => {
+    const missionId = await createAssembledMission("action-create");
+    const created = await createAction(
+      actionRequest(missionId, JSON.stringify(actionInput()), "action-create"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    const createdBody = await payload<{ data: ActionRecord }>(created);
+    assert.equal(created.status, 201);
+    assert.match(createdBody.data.action.id, /^[0-9a-f-]{36}$/);
+    assert.equal(createdBody.data.action.missionId, missionId);
+    assert.equal(createdBody.data.action.requiresApproval, false);
+    assert.equal(createdBody.data.action.status, "approved");
+
+    const listed = await getActions(
+      new Request(`http://localhost/api/missions/${missionId}/actions`),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    const listedBody = await payload<ActionsResponse>(listed);
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listedBody.data.actions, [createdBody.data]);
+
+    const injected = await createAction(
+      actionRequest(
+        missionId,
+        JSON.stringify({ ...actionInput(), status: "approved", requiresApproval: false }),
+        "action-injected",
+      ),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(injected.status, 400);
+  });
+
+  it("requires approval above a traveler limit and allows only one decision", async () => {
+    const missionId = await createAssembledMission("action-approval");
+    const proposed = await createAction(
+      actionRequest(missionId, JSON.stringify(actionInput(15_000)), "action-needs-approval"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    const proposedBody = await payload<{ data: ActionRecord }>(proposed);
+    assert.equal(proposedBody.data.action.requiresApproval, true);
+    assert.equal(proposedBody.data.action.status, "needs_approval");
+
+    const actionId = proposedBody.data.action.id;
+    const approved = await decideAction(
+      decisionRequest(missionId, actionId, "approve", "action-approve"),
+      { params: Promise.resolve({ id: missionId, actionId }) },
+    );
+    assert.equal(approved.status, 200);
+    assert.equal((await payload<{ data: ActionRecord }>(approved)).data.action.status, "approved");
+
+    const repeated = await decideAction(
+      decisionRequest(missionId, actionId, "reject", "action-repeat-decision"),
+      { params: Promise.resolve({ id: missionId, actionId }) },
+    );
+    assert.equal(repeated.status, 409);
+  });
+
+  it("rejects invalid action legs and cost changes", async () => {
+    const missionId = await createAssembledMission("action-errors");
+    const unknownLeg = await createAction(
+      actionRequest(
+        missionId,
+        JSON.stringify({ ...actionInput(), affectedLegIds: ["missing-leg"] }),
+        "action-unknown-leg",
+      ),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(unknownLeg.status, 400);
+
+    const impossibleRefund = await createAction(
+      actionRequest(missionId, JSON.stringify(actionInput(-50_000)), "action-invalid-refund"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(impossibleRefund.status, 400);
+
+    const paidNotification = await createAction(
+      actionRequest(
+        missionId,
+        JSON.stringify({ ...actionInput(100), kind: "notify" }),
+        "action-paid-notification",
+      ),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(paidNotification.status, 400);
   });
 
   it("returns a stable not-found error", async () => {
