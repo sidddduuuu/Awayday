@@ -1,7 +1,14 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { ItinerarySchema, MissionSchema, type Itinerary, type Mission } from "../trips/schemas.ts";
+import {
+  DisruptionSchema,
+  ItinerarySchema,
+  MissionSchema,
+  type Disruption,
+  type Itinerary,
+  type Mission,
+} from "../trips/schemas.ts";
 
 export interface MissionRecord {
   mission: Mission;
@@ -13,6 +20,12 @@ export interface ItineraryRecord extends Itinerary {
   missionId: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface DisruptionRecord {
+  missionId: string;
+  disruption: Disruption;
+  createdAt: string;
 }
 
 const globals = globalThis as typeof globalThis & {
@@ -46,6 +59,13 @@ export function openMissionDatabase(path: string) {
       payload TEXT NOT NULL CHECK (json_valid(payload)),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS disruptions (
+      mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+      id TEXT NOT NULL,
+      payload TEXT NOT NULL CHECK (json_valid(payload)),
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (mission_id, id)
     ) STRICT;
   `);
   return database;
@@ -122,6 +142,58 @@ export function findItinerary(database: DatabaseSync, missionId: string): Itiner
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function disruptionRecord(missionId: string, row: Record<string, unknown>): DisruptionRecord {
+  if (typeof row.payload !== "string" || typeof row.created_at !== "string") {
+    throw new Error("Stored disruption row has an invalid shape");
+  }
+  return {
+    missionId,
+    disruption: DisruptionSchema.parse(JSON.parse(row.payload)),
+    createdAt: row.created_at,
+  };
+}
+
+export function findDisruption(
+  database: DatabaseSync,
+  missionId: string,
+  disruptionId: string,
+): DisruptionRecord | null {
+  const row = database.prepare(`
+    SELECT payload, created_at
+    FROM disruptions
+    WHERE mission_id = ? AND id = ?
+  `).get(missionId, disruptionId);
+  return row ? disruptionRecord(missionId, row) : null;
+}
+
+export function listDisruptions(database: DatabaseSync, missionId: string): DisruptionRecord[] {
+  return database.prepare(`
+    SELECT payload, created_at
+    FROM disruptions
+    WHERE mission_id = ?
+  `).all(missionId)
+    .map((row) => disruptionRecord(missionId, row))
+    .toSorted((left, right) =>
+      Date.parse(left.disruption.reportedAt) - Date.parse(right.disruption.reportedAt)
+      || left.disruption.id.localeCompare(right.disruption.id));
+}
+
+export function saveDisruption(
+  database: DatabaseSync,
+  missionId: string,
+  disruption: Disruption,
+  now = new Date(),
+): { record: DisruptionRecord; created: boolean } {
+  const result = database.prepare(`
+    INSERT INTO disruptions (mission_id, id, payload, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (mission_id, id) DO NOTHING
+  `).run(missionId, disruption.id, JSON.stringify(disruption), now.toISOString());
+  const record = findDisruption(database, missionId, disruption.id);
+  if (!record) throw new Error("Saved disruption could not be read");
+  return { record, created: Number(result.changes) === 1 };
 }
 
 export function databaseIsHealthy(database: DatabaseSync) {

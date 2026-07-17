@@ -4,20 +4,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GET as health } from "../../app/api/health/route.ts";
+import { GET as getDisruptions, POST as createDisruption } from "../../app/api/missions/[id]/disruptions/route.ts";
 import { GET as getItinerary, PUT as putItinerary } from "../../app/api/missions/[id]/itinerary/route.ts";
 import { GET as getMission } from "../../app/api/missions/[id]/route.ts";
 import { POST as createMission } from "../../app/api/missions/route.ts";
 import {
   findItinerary,
+  listDisruptions,
   findMission,
   openMissionDatabase,
+  saveDisruption,
   saveItinerary,
   saveMission,
+  type DisruptionRecord,
   type ItineraryRecord,
   type MissionRecord,
 } from "./store.ts";
 import type { ReadinessResult } from "../trips/readiness.ts";
-import { MissionSchema, type CreateMission, type Itinerary } from "../trips/schemas.ts";
+import { MissionSchema, type CreateMission, type Disruption, type Itinerary } from "../trips/schemas.ts";
 
 process.env.AWAYDAY_DATABASE_PATH = ":memory:";
 
@@ -65,6 +69,15 @@ function itineraryInput(): Itinerary {
   };
 }
 
+function disruptionInput(id = "delay-1", legId = "airport-to-event"): Disruption {
+  return {
+    id,
+    legId,
+    reportedAt: new Date(Date.now() - 1_000).toISOString(),
+    impact: { type: "delay", minutes: 30, timing: "duration" },
+  };
+}
+
 function request(body: string, ip: string, origin = "http://localhost") {
   return new Request("http://localhost/api/missions", {
     method: "POST",
@@ -81,12 +94,39 @@ function itineraryRequest(missionId: string, body: string, ip: string, origin = 
   });
 }
 
+function disruptionRequest(missionId: string, body: string, ip: string) {
+  return new Request(`http://localhost/api/missions/${missionId}/disruptions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "http://localhost", "x-forwarded-for": ip },
+    body,
+  });
+}
+
 type ItineraryResponse = {
   data: { itinerary: ItineraryRecord; readiness: ReadinessResult };
 };
 
+type DisruptionResponse = {
+  data: { disruption: DisruptionRecord; readiness: ReadinessResult };
+};
+
+type DisruptionsResponse = {
+  data: { disruptions: DisruptionRecord[]; readiness: ReadinessResult };
+};
+
 async function payload<T>(response: Response) {
   return (await response.json()) as T;
+}
+
+async function createAssembledMission(key: string) {
+  const created = await createMission(request(JSON.stringify(missionInput()), `${key}-mission`));
+  const missionId = (await payload<{ data: MissionRecord }>(created)).data.mission.id;
+  const assembled = await putItinerary(
+    itineraryRequest(missionId, JSON.stringify(itineraryInput()), `${key}-itinerary`),
+    { params: Promise.resolve({ id: missionId }) },
+  );
+  assert.equal(assembled.status, 200);
+  return missionId;
 }
 
 describe("mission persistence", () => {
@@ -94,21 +134,25 @@ describe("mission persistence", () => {
     const directory = mkdtempSync(join(tmpdir(), "awayday-store-"));
     const path = join(directory, "missions.db");
     const mission = MissionSchema.parse({ id: "persisted-mission", ...missionInput() });
+    const disruption = disruptionInput("persisted-delay");
     try {
       const first = openMissionDatabase(path);
       saveMission(first, mission, new Date("2030-01-01T00:00:00Z"));
       saveItinerary(first, mission.id, itineraryInput(), new Date("2030-01-01T00:01:00Z"));
+      saveDisruption(first, mission.id, disruption, new Date("2030-01-01T00:02:00Z"));
       first.close();
 
       const second = openMissionDatabase(path);
       const stored = findMission(second, mission.id);
       const storedItinerary = findItinerary(second, mission.id);
+      const storedDisruptions = listDisruptions(second, mission.id);
       second.close();
 
       assert.deepEqual(stored?.mission, mission);
       assert.equal(stored?.createdAt, "2030-01-01T00:00:00.000Z");
       assert.deepEqual(storedItinerary?.legs, itineraryInput().legs);
       assert.equal(storedItinerary?.createdAt, "2030-01-01T00:01:00.000Z");
+      assert.deepEqual(storedDisruptions.map(({ disruption: item }) => item), [disruption]);
       assert.equal(statSync(path).mode & 0o777, 0o600);
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -203,6 +247,64 @@ describe("mission API", () => {
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(crossOrigin.status, 403);
+  });
+
+  it("ingests a disruption idempotently and recomputes live readiness", async () => {
+    const missionId = await createAssembledMission("disruption-live");
+    const disruption = disruptionInput();
+    const created = await createDisruption(
+      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-create"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    const createdBody = await payload<DisruptionResponse>(created);
+    assert.equal(created.status, 201);
+    assert.equal(createdBody.data.readiness.status, "at_risk");
+
+    const repeated = await createDisruption(
+      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-repeat"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(repeated.status, 200);
+
+    const listed = await getDisruptions(
+      new Request(`http://localhost/api/missions/${missionId}/disruptions`),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    const listedBody = await payload<DisruptionsResponse>(listed);
+    assert.equal(listedBody.data.disruptions.length, 1);
+    assert.equal(listedBody.data.readiness.status, "at_risk");
+
+    const itinerary = await getItinerary(
+      new Request(`http://localhost/api/missions/${missionId}/itinerary`),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal((await payload<ItineraryResponse>(itinerary)).data.readiness.status, "at_risk");
+  });
+
+  it("rejects conflicting disruption IDs and unknown legs", async () => {
+    const missionId = await createAssembledMission("disruption-errors");
+    const disruption = disruptionInput("delay-conflict");
+    await createDisruption(
+      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-first"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+
+    const conflict: Disruption = {
+      ...disruption,
+      impact: { type: "delay", minutes: 45, timing: "duration" },
+    };
+    const conflicted = await createDisruption(
+      disruptionRequest(missionId, JSON.stringify(conflict), "disruption-conflict"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(conflicted.status, 409);
+
+    const unknownLeg = disruptionInput("unknown-leg-delay", "missing-leg");
+    const invalid = await createDisruption(
+      disruptionRequest(missionId, JSON.stringify(unknownLeg), "disruption-unknown-leg"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(invalid.status, 400);
   });
 
   it("returns a stable not-found error", async () => {

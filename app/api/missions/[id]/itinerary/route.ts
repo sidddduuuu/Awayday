@@ -1,5 +1,11 @@
 import { assertSameOrigin, dataResponse, enforceMutationRateLimit, handleApiError, HttpError, readJson } from "../../../../../src/http.ts";
-import { findItinerary, findMission, missionDatabase, saveItinerary } from "../../../../../src/missions/store.ts";
+import {
+  findItinerary,
+  findMission,
+  listDisruptions,
+  missionDatabase,
+  saveItinerary,
+} from "../../../../../src/missions/store.ts";
 import { evaluateReadiness } from "../../../../../src/trips/readiness.ts";
 import {
   ItinerarySchema,
@@ -21,7 +27,11 @@ async function loadMission({ params }: RouteContext) {
 }
 
 function assembly(mission: Mission, legs: ItineraryLeg[]) {
-  return evaluateReadiness({ mission, legs, disruptions: [], evaluatedAt: new Date().toISOString() });
+  const legIds = new Set(legs.map(({ id }) => id));
+  const disruptions = listDisruptions(missionDatabase(), mission.id)
+    .map(({ disruption }) => disruption)
+    .filter(({ legId }) => legIds.has(legId));
+  return evaluateReadiness({ mission, legs, disruptions, evaluatedAt: new Date().toISOString() });
 }
 
 export async function GET(_request: Request, context: RouteContext) {
