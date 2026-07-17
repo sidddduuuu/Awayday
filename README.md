@@ -215,7 +215,11 @@ brew install pomerium-cli
 pomerium-cli --version
 ```
 
-Running the Pomerium gateway also requires Docker and a Pomerium Zero cluster token. Add its Compose configuration only after the protected Awayday service exists.
+Set `POMERIUM_ROUTE_URL` to the external protected origin, for example `https://awayday.<cluster>.pomerium.app`. Awayday verifies the signed `X-Pomerium-Jwt-Assertion` against that route's JWKS and owns each mission by the verified `sub`; unsigned claim headers are ignored.
+
+In Pomerium Zero, route the protected hostname to the internal `http://web:3000` service, enable **Pass Identity Headers** and **Preserve Host Header**, disable public access, and initially allow only the owner's email. Add a separate public route for `/api/integrations/nexla/disruptions`; its application-level ingest key remains required.
+
+On Akash, expose Pomerium on port 443 and keep `web:3000` internal. A Zero-managed gateway additionally needs a Pomerium cluster token, starter-domain hostname, and an Akash provider supporting an IP lease. Do not commit those deployment secrets.
 
 ### Akash
 

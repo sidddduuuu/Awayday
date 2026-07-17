@@ -59,7 +59,8 @@ export function openMissionDatabase(path: string) {
       id TEXT PRIMARY KEY,
       payload TEXT NOT NULL CHECK (json_valid(payload)),
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      owner_id TEXT NOT NULL CHECK (length(owner_id) BETWEEN 1 AND 255)
     ) STRICT;
     CREATE TABLE IF NOT EXISTS itineraries (
       mission_id TEXT PRIMARY KEY REFERENCES missions(id) ON DELETE CASCADE,
@@ -83,6 +84,15 @@ export function openMissionDatabase(path: string) {
       PRIMARY KEY (mission_id, id)
     ) STRICT;
   `);
+  const hasOwner = database.prepare(`
+    SELECT 1 AS present
+    FROM pragma_table_info('missions')
+    WHERE name = 'owner_id'
+  `).get();
+  if (!hasOwner) {
+    // ponytail: legacy rows stay ownerless/inaccessible; add a claiming flow only if real data needs migration.
+    database.exec("ALTER TABLE missions ADD COLUMN owner_id TEXT CHECK (length(owner_id) BETWEEN 1 AND 255)");
+  }
   return database;
 }
 
@@ -96,21 +106,21 @@ export function missionDatabase() {
   return globals.awaydayDatabase;
 }
 
-export function saveMission(database: DatabaseSync, mission: Mission, now = new Date()): MissionRecord {
+export function saveMission(
+  database: DatabaseSync,
+  mission: Mission,
+  ownerId: string,
+  now = new Date(),
+): MissionRecord {
   const timestamp = now.toISOString();
   database.prepare(`
-    INSERT INTO missions (id, payload, created_at, updated_at)
-    VALUES (?, ?, ?, ?)
-  `).run(mission.id, JSON.stringify(mission), timestamp, timestamp);
+    INSERT INTO missions (id, payload, created_at, updated_at, owner_id)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(mission.id, JSON.stringify(mission), timestamp, timestamp, ownerId);
   return { mission, createdAt: timestamp, updatedAt: timestamp };
 }
 
-export function findMission(database: DatabaseSync, id: string): MissionRecord | null {
-  const row = database.prepare(`
-    SELECT payload, created_at, updated_at
-    FROM missions
-    WHERE id = ?
-  `).get(id);
+function missionRecord(row: Record<string, unknown> | undefined): MissionRecord | null {
   if (!row) return null;
   if (typeof row.payload !== "string" || typeof row.created_at !== "string" || typeof row.updated_at !== "string") {
     throw new Error("Stored mission row has an invalid shape");
@@ -120,6 +130,28 @@ export function findMission(database: DatabaseSync, id: string): MissionRecord |
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+export function findMissionForIntegration(database: DatabaseSync, id: string): MissionRecord | null {
+  const row = database.prepare(`
+    SELECT payload, created_at, updated_at
+    FROM missions
+    WHERE id = ?
+  `).get(id);
+  return missionRecord(row);
+}
+
+export function findOwnedMission(
+  database: DatabaseSync,
+  id: string,
+  ownerId: string,
+): MissionRecord | null {
+  const row = database.prepare(`
+    SELECT payload, created_at, updated_at
+    FROM missions
+    WHERE id = ? AND owner_id = ?
+  `).get(id, ownerId);
+  return missionRecord(row);
 }
 
 export function saveItinerary(

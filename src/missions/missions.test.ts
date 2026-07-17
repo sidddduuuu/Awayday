@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync, sign as signData } from "node:crypto";
+import { once } from "node:events";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { DatabaseSync } from "node:sqlite";
+import { after, before, describe, it } from "node:test";
 import { GET as health } from "../../app/api/health/route.ts";
 import { POST as ingestNexlaDisruption } from "../../app/api/integrations/nexla/disruptions/route.ts";
 import { GET as getActions, POST as createAction } from "../../app/api/missions/[id]/actions/route.ts";
@@ -13,9 +17,10 @@ import { GET as getMission } from "../../app/api/missions/[id]/route.ts";
 import { POST as createMission } from "../../app/api/missions/route.ts";
 import {
   findItinerary,
+  findOwnedMission,
   listActions,
   listDisruptions,
-  findMission,
+  findMissionForIntegration,
   openMissionDatabase,
   saveAction,
   saveDisruption,
@@ -37,6 +42,66 @@ import {
 } from "../trips/schemas.ts";
 
 process.env.AWAYDAY_DATABASE_PATH = ":memory:";
+
+const authKeys = generateKeyPairSync("ec", { namedCurve: "P-256" });
+const publicJwk = {
+  ...authKeys.publicKey.export({ format: "jwk" }),
+  alg: "ES256",
+  kid: "awayday-test-key",
+  use: "sig",
+};
+const previousPomeriumRoute = process.env.POMERIUM_ROUTE_URL;
+let publicOrigin = "http://127.0.0.1";
+const jwksServer = createServer((request, response) => {
+  if (request.url !== "/.well-known/pomerium/jwks.json") {
+    response.writeHead(404).end();
+    return;
+  }
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(JSON.stringify({ keys: [publicJwk] }));
+});
+
+before(async () => {
+  jwksServer.listen(0, "127.0.0.1");
+  await once(jwksServer, "listening");
+  const address = jwksServer.address();
+  if (!address || typeof address === "string") throw new Error("JWKS test server did not start");
+  publicOrigin = `http://127.0.0.1:${address.port}`;
+  process.env.POMERIUM_ROUTE_URL = publicOrigin;
+});
+
+after(async () => {
+  jwksServer.close();
+  await once(jwksServer, "close");
+  if (previousPomeriumRoute === undefined) delete process.env.POMERIUM_ROUTE_URL;
+  else process.env.POMERIUM_ROUTE_URL = previousPomeriumRoute;
+});
+
+function encodeJwtPart(value: unknown) {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function authToken(
+  subject: string,
+  audience = new URL(publicOrigin).hostname,
+  expiresAt = Math.floor(Date.now() / 1_000) + 300,
+) {
+  const now = Math.floor(Date.now() / 1_000);
+  const header = encodeJwtPart({ alg: "ES256", kid: publicJwk.kid, typ: "JWT" });
+  const payload = encodeJwtPart({ aud: audience, exp: expiresAt, iat: now, iss: new URL(publicOrigin).hostname, sub: subject });
+  const message = `${header}.${payload}`;
+  const signature = signData("sha256", Buffer.from(message), {
+    key: authKeys.privateKey,
+    dsaEncoding: "ieee-p1363",
+  }).toString("base64url");
+  return `${message}.${signature}`;
+}
+
+function authenticatedRequest(path: string, ownerId: string, audience?: string) {
+  return new Request(`${publicOrigin}${path}`, {
+    headers: { "x-pomerium-jwt-assertion": authToken(ownerId, audience) },
+  });
+}
 
 function missionInput(): CreateMission {
   return {
@@ -100,32 +165,47 @@ function actionInput(costDeltaCents = 5_000): CreateAction {
   };
 }
 
-function request(body: string, ip: string, origin = "http://localhost") {
-  return new Request("http://localhost/api/missions", {
+function request(body: string, ip: string, origin = publicOrigin, ownerId = ip) {
+  return new Request(`${publicOrigin}/api/missions`, {
     method: "POST",
-    headers: { "content-type": "application/json", origin, "x-forwarded-for": ip },
+    headers: {
+      "content-type": "application/json",
+      origin,
+      "x-forwarded-for": ip,
+      "x-pomerium-jwt-assertion": authToken(ownerId),
+    },
     body,
   });
 }
 
-function itineraryRequest(missionId: string, body: string, ip: string, origin = "http://localhost") {
-  return new Request(`http://localhost/api/missions/${missionId}/itinerary`, {
+function itineraryRequest(missionId: string, body: string, ip: string, origin = publicOrigin, ownerId = ip) {
+  return new Request(`${publicOrigin}/api/missions/${missionId}/itinerary`, {
     method: "PUT",
-    headers: { "content-type": "application/json", origin, "x-forwarded-for": ip },
+    headers: {
+      "content-type": "application/json",
+      origin,
+      "x-forwarded-for": ip,
+      "x-pomerium-jwt-assertion": authToken(ownerId),
+    },
     body,
   });
 }
 
-function disruptionRequest(missionId: string, body: string, ip: string) {
-  return new Request(`http://localhost/api/missions/${missionId}/disruptions`, {
+function disruptionRequest(missionId: string, body: string, ip: string, ownerId = ip) {
+  return new Request(`${publicOrigin}/api/missions/${missionId}/disruptions`, {
     method: "POST",
-    headers: { "content-type": "application/json", origin: "http://localhost", "x-forwarded-for": ip },
+    headers: {
+      "content-type": "application/json",
+      origin: publicOrigin,
+      "x-forwarded-for": ip,
+      "x-pomerium-jwt-assertion": authToken(ownerId),
+    },
     body,
   });
 }
 
 function nexlaRequest(body: string, key: string, ip: string) {
-  return new Request("http://localhost/api/integrations/nexla/disruptions", {
+  return new Request(`${publicOrigin}/api/integrations/nexla/disruptions`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -136,18 +216,34 @@ function nexlaRequest(body: string, key: string, ip: string) {
   });
 }
 
-function actionRequest(missionId: string, body: string, ip: string) {
-  return new Request(`http://localhost/api/missions/${missionId}/actions`, {
+function actionRequest(missionId: string, body: string, ip: string, ownerId = ip) {
+  return new Request(`${publicOrigin}/api/missions/${missionId}/actions`, {
     method: "POST",
-    headers: { "content-type": "application/json", origin: "http://localhost", "x-forwarded-for": ip },
+    headers: {
+      "content-type": "application/json",
+      origin: publicOrigin,
+      "x-forwarded-for": ip,
+      "x-pomerium-jwt-assertion": authToken(ownerId),
+    },
     body,
   });
 }
 
-function decisionRequest(missionId: string, actionId: string, decision: "approve" | "reject", ip: string) {
-  return new Request(`http://localhost/api/missions/${missionId}/actions/${actionId}/decision`, {
+function decisionRequest(
+  missionId: string,
+  actionId: string,
+  decision: "approve" | "reject",
+  ip: string,
+  ownerId = ip,
+) {
+  return new Request(`${publicOrigin}/api/missions/${missionId}/actions/${actionId}/decision`, {
     method: "POST",
-    headers: { "content-type": "application/json", origin: "http://localhost", "x-forwarded-for": ip },
+    headers: {
+      "content-type": "application/json",
+      origin: publicOrigin,
+      "x-forwarded-for": ip,
+      "x-pomerium-jwt-assertion": authToken(ownerId),
+    },
     body: JSON.stringify({ decision }),
   });
 }
@@ -171,14 +267,14 @@ async function payload<T>(response: Response) {
 }
 
 async function createAssembledMission(key: string) {
-  const created = await createMission(request(JSON.stringify(missionInput()), `${key}-mission`));
+  const created = await createMission(request(JSON.stringify(missionInput()), `${key}-mission`, publicOrigin, key));
   const missionId = (await payload<{ data: MissionRecord }>(created)).data.mission.id;
   const assembled = await putItinerary(
-    itineraryRequest(missionId, JSON.stringify(itineraryInput()), `${key}-itinerary`),
+    itineraryRequest(missionId, JSON.stringify(itineraryInput()), `${key}-itinerary`, publicOrigin, key),
     { params: Promise.resolve({ id: missionId }) },
   );
   assert.equal(assembled.status, 200);
-  return missionId;
+  return { missionId, ownerId: key };
 }
 
 describe("mission persistence", () => {
@@ -197,26 +293,62 @@ describe("mission persistence", () => {
     });
     try {
       const first = openMissionDatabase(path);
-      saveMission(first, mission, new Date("2030-01-01T00:00:00Z"));
+      saveMission(first, mission, "persist-owner", new Date("2030-01-01T00:00:00Z"));
       saveItinerary(first, mission.id, itineraryInput(), new Date("2030-01-01T00:01:00Z"));
       saveDisruption(first, mission.id, disruption, new Date("2030-01-01T00:02:00Z"));
       saveAction(first, action, new Date("2030-01-01T00:03:00Z"));
       first.close();
 
       const second = openMissionDatabase(path);
-      const stored = findMission(second, mission.id);
+      const stored = findMissionForIntegration(second, mission.id);
+      const owned = findOwnedMission(second, mission.id, "persist-owner");
+      const hidden = findOwnedMission(second, mission.id, "other-owner");
       const storedItinerary = findItinerary(second, mission.id);
       const storedDisruptions = listDisruptions(second, mission.id);
       const storedActions = listActions(second, mission.id);
       second.close();
 
       assert.deepEqual(stored?.mission, mission);
+      assert.deepEqual(owned?.mission, mission);
+      assert.equal(hidden, null);
       assert.equal(stored?.createdAt, "2030-01-01T00:00:00.000Z");
       assert.deepEqual(storedItinerary?.legs, itineraryInput().legs);
       assert.equal(storedItinerary?.createdAt, "2030-01-01T00:01:00.000Z");
       assert.deepEqual(storedDisruptions.map(({ disruption: item }) => item), [disruption]);
       assert.deepEqual(storedActions.map(({ action: item }) => item), [action]);
       assert.equal(statSync(path).mode & 0o777, 0o600);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps legacy ownerless missions inaccessible after migration", () => {
+    const directory = mkdtempSync(join(tmpdir(), "awayday-legacy-store-"));
+    const path = join(directory, "missions.db");
+    const mission = MissionSchema.parse({ id: "legacy-mission", ...missionInput() });
+    try {
+      const legacy = new DatabaseSync(path);
+      legacy.exec(`
+        CREATE TABLE missions (
+          id TEXT PRIMARY KEY,
+          payload TEXT NOT NULL CHECK (json_valid(payload)),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        ) STRICT
+      `);
+      legacy.prepare(`
+        INSERT INTO missions (id, payload, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+      `).run(mission.id, JSON.stringify(mission), "2030-01-01T00:00:00.000Z", "2030-01-01T00:00:00.000Z");
+      legacy.close();
+
+      const migrated = openMissionDatabase(path);
+      const unscoped = findMissionForIntegration(migrated, mission.id);
+      const owned = findOwnedMission(migrated, mission.id, "new-owner");
+      migrated.close();
+
+      assert.deepEqual(unscoped?.mission, mission);
+      assert.equal(owned, null);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -238,18 +370,50 @@ describe("mission API", () => {
     assert.equal(created.headers.get("cache-control"), "no-store");
 
     const found = await getMission(
-      new Request(`http://localhost/api/missions/${createdBody.data.mission.id}`),
+      authenticatedRequest(`/api/missions/${createdBody.data.mission.id}`, "create-read"),
       { params: Promise.resolve({ id: createdBody.data.mission.id }) },
     );
     assert.equal(found.status, 200);
     assert.deepEqual(await payload(found), createdBody);
+
+    const hidden = await getMission(
+      authenticatedRequest(`/api/missions/${createdBody.data.mission.id}`, "other-owner"),
+      { params: Promise.resolve({ id: createdBody.data.mission.id }) },
+    );
+    assert.equal(hidden.status, 404);
+  });
+
+  it("requires a valid signed Pomerium assertion", async () => {
+    const missing = new Request(`${publicOrigin}/api/missions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: publicOrigin },
+      body: JSON.stringify(missionInput()),
+    });
+    const missingResponse = await createMission(missing);
+    assert.equal(missingResponse.status, 401);
+    assert.equal((await payload<{ error: { code: string } }>(missingResponse)).error.code, "AUTH_REQUIRED");
+
+    const wrongAudience = request(JSON.stringify(missionInput()), "wrong-audience");
+    wrongAudience.headers.set("x-pomerium-jwt-assertion", authToken("wrong-audience", "other.example.com"));
+    assert.equal((await createMission(wrongAudience)).status, 401);
+
+    const expired = request(JSON.stringify(missionInput()), "expired");
+    expired.headers.set("x-pomerium-jwt-assertion", authToken("expired", undefined, 1));
+    assert.equal((await createMission(expired)).status, 401);
+
+    const tampered = request(JSON.stringify(missionInput()), "tampered");
+    const token = authToken("tampered");
+    const signatureStart = token.lastIndexOf(".") + 1;
+    const changed = token[signatureStart] === "A" ? "B" : "A";
+    tampered.headers.set("x-pomerium-jwt-assertion", `${token.slice(0, signatureStart)}${changed}${token.slice(signatureStart + 1)}`);
+    assert.equal((await createMission(tampered)).status, 401);
   });
 
   it("assembles, replaces, and reads a mission itinerary with derived readiness", async () => {
     const created = await createMission(request(JSON.stringify(missionInput()), "itinerary-create"));
     const missionId = (await payload<{ data: MissionRecord }>(created)).data.mission.id;
     const first = await putItinerary(
-      itineraryRequest(missionId, JSON.stringify(itineraryInput()), "itinerary-save"),
+      itineraryRequest(missionId, JSON.stringify(itineraryInput()), "itinerary-save", publicOrigin, "itinerary-create"),
       { params: Promise.resolve({ id: missionId }) },
     );
     const firstBody = await payload<ItineraryResponse>(first);
@@ -261,20 +425,26 @@ describe("mission API", () => {
     const original = itineraryInput();
     const replacement = { legs: [{ ...original.legs[0], id: "airport-to-event-v2" }] };
     const replaced = await putItinerary(
-      itineraryRequest(missionId, JSON.stringify(replacement), "itinerary-replace"),
+      itineraryRequest(missionId, JSON.stringify(replacement), "itinerary-replace", publicOrigin, "itinerary-create"),
       { params: Promise.resolve({ id: missionId }) },
     );
     const replacedBody = await payload<ItineraryResponse>(replaced);
     assert.equal(replacedBody.data.itinerary.createdAt, firstBody.data.itinerary.createdAt);
 
     const found = await getItinerary(
-      new Request(`http://localhost/api/missions/${missionId}/itinerary`),
+      authenticatedRequest(`/api/missions/${missionId}/itinerary`, "itinerary-create"),
       { params: Promise.resolve({ id: missionId }) },
     );
     const foundBody = await payload<ItineraryResponse>(found);
     assert.equal(found.status, 200);
     assert.deepEqual(foundBody.data.itinerary.legs, replacement.legs);
     assert.equal(foundBody.data.readiness.status, "ready");
+
+    const hidden = await getItinerary(
+      authenticatedRequest(`/api/missions/${missionId}/itinerary`, "other-owner"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(hidden.status, 404);
   });
 
   it("rejects invalid itinerary ownership and missing resources", async () => {
@@ -287,7 +457,7 @@ describe("mission API", () => {
     const created = await createMission(request(JSON.stringify(missionInput()), "itinerary-errors"));
     const missionId = (await payload<{ data: MissionRecord }>(created)).data.mission.id;
     const noItinerary = await getItinerary(
-      new Request(`http://localhost/api/missions/${missionId}/itinerary`),
+      authenticatedRequest(`/api/missions/${missionId}/itinerary`, "itinerary-errors"),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(noItinerary.status, 404);
@@ -300,23 +470,35 @@ describe("mission API", () => {
       }],
     };
     const invalidTraveler = await putItinerary(
-      itineraryRequest(missionId, JSON.stringify(invalid), "invalid-itinerary-traveler"),
+      itineraryRequest(
+        missionId,
+        JSON.stringify(invalid),
+        "invalid-itinerary-traveler",
+        publicOrigin,
+        "itinerary-errors",
+      ),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(invalidTraveler.status, 400);
 
     const crossOrigin = await putItinerary(
-      itineraryRequest(missionId, JSON.stringify(itineraryInput()), "itinerary-cross-origin", "https://attacker.example"),
+      itineraryRequest(
+        missionId,
+        JSON.stringify(itineraryInput()),
+        "itinerary-cross-origin",
+        "https://attacker.example",
+        "itinerary-errors",
+      ),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(crossOrigin.status, 403);
   });
 
   it("ingests a disruption idempotently and recomputes live readiness", async () => {
-    const missionId = await createAssembledMission("disruption-live");
+    const { missionId, ownerId } = await createAssembledMission("disruption-live");
     const disruption = disruptionInput();
     const created = await createDisruption(
-      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-create"),
+      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-create", ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     const createdBody = await payload<DisruptionResponse>(created);
@@ -324,31 +506,37 @@ describe("mission API", () => {
     assert.equal(createdBody.data.readiness.status, "at_risk");
 
     const repeated = await createDisruption(
-      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-repeat"),
+      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-repeat", ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(repeated.status, 200);
 
     const listed = await getDisruptions(
-      new Request(`http://localhost/api/missions/${missionId}/disruptions`),
+      authenticatedRequest(`/api/missions/${missionId}/disruptions`, ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     const listedBody = await payload<DisruptionsResponse>(listed);
     assert.equal(listedBody.data.disruptions.length, 1);
     assert.equal(listedBody.data.readiness.status, "at_risk");
 
+    const hidden = await getDisruptions(
+      authenticatedRequest(`/api/missions/${missionId}/disruptions`, "other-owner"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(hidden.status, 404);
+
     const itinerary = await getItinerary(
-      new Request(`http://localhost/api/missions/${missionId}/itinerary`),
+      authenticatedRequest(`/api/missions/${missionId}/itinerary`, ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal((await payload<ItineraryResponse>(itinerary)).data.readiness.status, "at_risk");
   });
 
   it("rejects conflicting disruption IDs and unknown legs", async () => {
-    const missionId = await createAssembledMission("disruption-errors");
+    const { missionId, ownerId } = await createAssembledMission("disruption-errors");
     const disruption = disruptionInput("delay-conflict");
     await createDisruption(
-      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-first"),
+      disruptionRequest(missionId, JSON.stringify(disruption), "disruption-first", ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
 
@@ -357,14 +545,14 @@ describe("mission API", () => {
       impact: { type: "delay", minutes: 45, timing: "duration" },
     };
     const conflicted = await createDisruption(
-      disruptionRequest(missionId, JSON.stringify(conflict), "disruption-conflict"),
+      disruptionRequest(missionId, JSON.stringify(conflict), "disruption-conflict", ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(conflicted.status, 409);
 
     const unknownLeg = disruptionInput("unknown-leg-delay", "missing-leg");
     const invalid = await createDisruption(
-      disruptionRequest(missionId, JSON.stringify(unknownLeg), "disruption-unknown-leg"),
+      disruptionRequest(missionId, JSON.stringify(unknownLeg), "disruption-unknown-leg", ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(invalid.status, 400);
@@ -391,7 +579,7 @@ describe("mission API", () => {
     const key = "test-only-nexla-ingest-key-000000000000";
     process.env.NEXLA_INGEST_KEY = key;
     try {
-      const missionId = await createAssembledMission("nexla-live");
+      const { missionId } = await createAssembledMission("nexla-live");
       const disruption = disruptionInput("nexla-delay");
       const body = JSON.stringify({ missionId, ...disruption });
       const created = await ingestNexlaDisruption(nexlaRequest(body, key, "nexla-create"));
@@ -413,9 +601,9 @@ describe("mission API", () => {
   });
 
   it("creates server-controlled actions and lists them", async () => {
-    const missionId = await createAssembledMission("action-create");
+    const { missionId, ownerId } = await createAssembledMission("action-create");
     const created = await createAction(
-      actionRequest(missionId, JSON.stringify(actionInput()), "action-create"),
+      actionRequest(missionId, JSON.stringify(actionInput()), "action-create", ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     const createdBody = await payload<{ data: ActionRecord }>(created);
@@ -426,18 +614,25 @@ describe("mission API", () => {
     assert.equal(createdBody.data.action.status, "approved");
 
     const listed = await getActions(
-      new Request(`http://localhost/api/missions/${missionId}/actions`),
+      authenticatedRequest(`/api/missions/${missionId}/actions`, ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     const listedBody = await payload<ActionsResponse>(listed);
     assert.equal(listed.status, 200);
     assert.deepEqual(listedBody.data.actions, [createdBody.data]);
 
+    const hidden = await getActions(
+      authenticatedRequest(`/api/missions/${missionId}/actions`, "other-owner"),
+      { params: Promise.resolve({ id: missionId }) },
+    );
+    assert.equal(hidden.status, 404);
+
     const injected = await createAction(
       actionRequest(
         missionId,
         JSON.stringify({ ...actionInput(), status: "approved", requiresApproval: false }),
         "action-injected",
+        ownerId,
       ),
       { params: Promise.resolve({ id: missionId }) },
     );
@@ -445,9 +640,9 @@ describe("mission API", () => {
   });
 
   it("requires approval above a traveler limit and allows only one decision", async () => {
-    const missionId = await createAssembledMission("action-approval");
+    const { missionId, ownerId } = await createAssembledMission("action-approval");
     const proposed = await createAction(
-      actionRequest(missionId, JSON.stringify(actionInput(15_000)), "action-needs-approval"),
+      actionRequest(missionId, JSON.stringify(actionInput(15_000)), "action-needs-approval", ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     const proposedBody = await payload<{ data: ActionRecord }>(proposed);
@@ -455,34 +650,41 @@ describe("mission API", () => {
     assert.equal(proposedBody.data.action.status, "needs_approval");
 
     const actionId = proposedBody.data.action.id;
+    const unauthorized = await decideAction(
+      decisionRequest(missionId, actionId, "approve", "action-wrong-owner", "other-owner"),
+      { params: Promise.resolve({ id: missionId, actionId }) },
+    );
+    assert.equal(unauthorized.status, 404);
+
     const approved = await decideAction(
-      decisionRequest(missionId, actionId, "approve", "action-approve"),
+      decisionRequest(missionId, actionId, "approve", "action-approve", ownerId),
       { params: Promise.resolve({ id: missionId, actionId }) },
     );
     assert.equal(approved.status, 200);
     assert.equal((await payload<{ data: ActionRecord }>(approved)).data.action.status, "approved");
 
     const repeated = await decideAction(
-      decisionRequest(missionId, actionId, "reject", "action-repeat-decision"),
+      decisionRequest(missionId, actionId, "reject", "action-repeat-decision", ownerId),
       { params: Promise.resolve({ id: missionId, actionId }) },
     );
     assert.equal(repeated.status, 409);
   });
 
   it("rejects invalid action legs and cost changes", async () => {
-    const missionId = await createAssembledMission("action-errors");
+    const { missionId, ownerId } = await createAssembledMission("action-errors");
     const unknownLeg = await createAction(
       actionRequest(
         missionId,
         JSON.stringify({ ...actionInput(), affectedLegIds: ["missing-leg"] }),
         "action-unknown-leg",
+        ownerId,
       ),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(unknownLeg.status, 400);
 
     const impossibleRefund = await createAction(
-      actionRequest(missionId, JSON.stringify(actionInput(-50_000)), "action-invalid-refund"),
+      actionRequest(missionId, JSON.stringify(actionInput(-50_000)), "action-invalid-refund", ownerId),
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(impossibleRefund.status, 400);
@@ -492,6 +694,7 @@ describe("mission API", () => {
         missionId,
         JSON.stringify({ ...actionInput(100), kind: "notify" }),
         "action-paid-notification",
+        ownerId,
       ),
       { params: Promise.resolve({ id: missionId }) },
     );
@@ -500,7 +703,7 @@ describe("mission API", () => {
 
   it("returns a stable not-found error", async () => {
     const response = await getMission(
-      new Request("http://localhost/api/missions/missing-mission"),
+      authenticatedRequest("/api/missions/missing-mission", "missing-owner"),
       { params: Promise.resolve({ id: "missing-mission" }) },
     );
     assert.equal(response.status, 404);
@@ -529,6 +732,10 @@ describe("mission API", () => {
     );
     assert.equal(crossOrigin.status, 403);
     assert.equal((await payload<{ error: { code: string } }>(crossOrigin)).error.code, "ORIGIN_FORBIDDEN");
+
+    const noOrigin = request(JSON.stringify(missionInput()), "missing-origin");
+    noOrigin.headers.delete("origin");
+    assert.equal((await createMission(noOrigin)).status, 403);
   });
 
   it("rate limits repeated mission creation", async () => {

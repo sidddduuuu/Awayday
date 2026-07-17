@@ -1,8 +1,8 @@
-import { assertSameOrigin, dataResponse, enforceMutationRateLimit, handleApiError, HttpError, readJson } from "../../../../../src/http.ts";
+import { assertSameOrigin, authenticatedSubject, dataResponse, enforceMutationRateLimit, handleApiError, HttpError, readJson } from "../../../../../src/http.ts";
 import { currentTripState, ingestDisruption } from "../../../../../src/missions/disruptions.ts";
 import {
   findItinerary,
-  findMission,
+  findOwnedMission,
   missionDatabase,
 } from "../../../../../src/missions/store.ts";
 import { DisruptionSchema, ResourceIdSchema } from "../../../../../src/trips/schemas.ts";
@@ -12,19 +12,19 @@ export const dynamic = "force-dynamic";
 
 type RouteContext = { params: Promise<{ id: string }> };
 
-async function loadTrip({ params }: RouteContext) {
+async function loadTrip({ params }: RouteContext, ownerId: string) {
   const id = ResourceIdSchema.parse((await params).id);
   const database = missionDatabase();
-  const mission = findMission(database, id)?.mission;
+  const mission = findOwnedMission(database, id, ownerId)?.mission;
   if (!mission) throw new HttpError(404, "MISSION_NOT_FOUND", "Mission not found");
   const itinerary = findItinerary(database, id);
   if (!itinerary) throw new HttpError(404, "ITINERARY_NOT_FOUND", "Itinerary not found");
   return { database, mission, itinerary };
 }
 
-export async function GET(_request: Request, context: RouteContext) {
+export async function GET(request: Request, context: RouteContext) {
   try {
-    const trip = await loadTrip(context);
+    const trip = await loadTrip(context, await authenticatedSubject(request));
     return dataResponse(currentTripState(trip.database, trip.mission, trip.itinerary.legs));
   } catch (error) {
     return handleApiError(error, "disruption_list_failed");
@@ -33,9 +33,10 @@ export async function GET(_request: Request, context: RouteContext) {
 
 export async function POST(request: Request, context: RouteContext) {
   try {
+    const ownerId = await authenticatedSubject(request);
     assertSameOrigin(request);
-    enforceMutationRateLimit(request);
-    const trip = await loadTrip(context);
+    enforceMutationRateLimit(ownerId);
+    const trip = await loadTrip(context, ownerId);
     const disruption = DisruptionSchema.parse(await readJson(request));
     const result = ingestDisruption(trip.database, trip.mission, trip.itinerary.legs, disruption);
     if (result.outcome === "conflict") {

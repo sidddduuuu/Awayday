@@ -1,5 +1,6 @@
 import {
   assertSameOrigin,
+  authenticatedSubject,
   dataResponse,
   enforceMutationRateLimit,
   handleApiError,
@@ -9,7 +10,7 @@ import {
 import { proposeAction } from "../../../../../src/missions/actions.ts";
 import {
   findItinerary,
-  findMission,
+  findOwnedMission,
   listActions,
   missionDatabase,
   saveAction,
@@ -25,16 +26,16 @@ async function missionId({ params }: RouteContext) {
   return ResourceIdSchema.parse((await params).id);
 }
 
-async function loadMission(context: RouteContext) {
+async function loadMission(context: RouteContext, ownerId: string) {
   const id = await missionId(context);
-  const mission = findMission(missionDatabase(), id)?.mission;
+  const mission = findOwnedMission(missionDatabase(), id, ownerId)?.mission;
   if (!mission) throw new HttpError(404, "MISSION_NOT_FOUND", "Mission not found");
   return mission;
 }
 
-export async function GET(_request: Request, context: RouteContext) {
+export async function GET(request: Request, context: RouteContext) {
   try {
-    const mission = await loadMission(context);
+    const mission = await loadMission(context, await authenticatedSubject(request));
     return dataResponse({ actions: listActions(missionDatabase(), mission.id) });
   } catch (error) {
     return handleApiError(error, "action_list_failed");
@@ -43,9 +44,10 @@ export async function GET(_request: Request, context: RouteContext) {
 
 export async function POST(request: Request, context: RouteContext) {
   try {
+    const ownerId = await authenticatedSubject(request);
     assertSameOrigin(request);
-    enforceMutationRateLimit(request);
-    const mission = await loadMission(context);
+    enforceMutationRateLimit(ownerId);
+    const mission = await loadMission(context, ownerId);
     const itinerary = findItinerary(missionDatabase(), mission.id);
     if (!itinerary) throw new HttpError(404, "ITINERARY_NOT_FOUND", "Itinerary not found");
     const input = CreateActionSchema.parse(await readJson(request));

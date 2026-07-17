@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { dataResponse, enforceMutationRateLimit, handleApiError, HttpError, readJson } from "../../../../../src/http.ts";
 import { ingestDisruption } from "../../../../../src/missions/disruptions.ts";
-import { findItinerary, findMission, missionDatabase } from "../../../../../src/missions/store.ts";
+import { findItinerary, findMissionForIntegration, missionDatabase } from "../../../../../src/missions/store.ts";
 import { DisruptionSchema, ResourceIdSchema } from "../../../../../src/trips/schemas.ts";
 
 export const runtime = "nodejs";
@@ -25,11 +25,11 @@ function assertNexlaKey(request: Request) {
 export async function POST(request: Request) {
   try {
     assertNexlaKey(request);
-    enforceMutationRateLimit(request);
+    enforceMutationRateLimit("nexla");
     const parsed = NexlaDisruptionSchema.parse(await readJson(request));
     const { missionId, ...disruption } = parsed;
     const database = missionDatabase();
-    const mission = findMission(database, missionId)?.mission;
+    const mission = findMissionForIntegration(database, missionId)?.mission;
     if (!mission) throw new HttpError(404, "MISSION_NOT_FOUND", "Mission not found");
     const itinerary = findItinerary(database, missionId);
     if (!itinerary) throw new HttpError(404, "ITINERARY_NOT_FOUND", "Itinerary not found");

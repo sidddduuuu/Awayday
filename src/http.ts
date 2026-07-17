@@ -1,9 +1,11 @@
 import { ZodError } from "zod";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const MAX_JSON_BYTES = 64 * 1024;
 const RATE_LIMIT = 20;
 const RATE_WINDOW_MS = 60_000;
 const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+let pomeriumKeys: { route: string; keys: ReturnType<typeof createRemoteJWKSet> } | undefined;
 
 export class HttpError extends Error {
   readonly status: number;
@@ -77,11 +79,67 @@ export async function readJson(request: Request) {
   }
 }
 
+function pomeriumRoute() {
+  const configured = process.env.POMERIUM_ROUTE_URL;
+  if (!configured) throw new HttpError(503, "AUTH_NOT_CONFIGURED", "Authentication is not configured");
+  try {
+    const route = new URL(configured);
+    const loopback = route.hostname === "localhost" || route.hostname === "127.0.0.1" || route.hostname === "[::1]";
+    if ((route.protocol !== "https:" && !loopback) || route.username || route.password) throw new Error();
+    return route;
+  } catch {
+    throw new HttpError(503, "AUTH_NOT_CONFIGURED", "Authentication is not configured");
+  }
+}
+
+function jwks(route: URL) {
+  if (pomeriumKeys?.route === route.origin) return pomeriumKeys.keys;
+  const url = new URL("/.well-known/pomerium/jwks.json", route);
+  const keys = createRemoteJWKSet(url, { timeoutDuration: 5_000 });
+  pomeriumKeys = { route: route.origin, keys };
+  return keys;
+}
+
+function jwksUnavailable(error: unknown) {
+  if (error instanceof TypeError) return true;
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  return error.code === "ERR_JWKS_TIMEOUT" || error.code === "ERR_JWKS_FETCH_FAILED";
+}
+
+export async function authenticatedSubject(request: Request) {
+  const route = pomeriumRoute();
+  const assertion = request.headers.get("x-pomerium-jwt-assertion");
+  if (!assertion) throw new HttpError(401, "AUTH_REQUIRED", "Authentication is required");
+  try {
+    const { payload } = await jwtVerify(assertion, jwks(route), {
+      algorithms: ["ES256"],
+      issuer: route.hostname,
+      audience: route.hostname,
+    });
+    if (
+      typeof payload.sub !== "string"
+      || payload.sub.length === 0
+      || payload.sub.length > 255
+      || /[\u0000-\u001f\u007f]/u.test(payload.sub)
+      || typeof payload.exp !== "number"
+    ) {
+      throw new Error("Invalid subject");
+    }
+    return payload.sub;
+  } catch (error) {
+    if (jwksUnavailable(error)) {
+      throw new HttpError(503, "AUTH_UNAVAILABLE", "Authentication is temporarily unavailable");
+    }
+    throw new HttpError(401, "AUTH_INVALID", "Authentication is invalid");
+  }
+}
+
 export function assertSameOrigin(request: Request) {
   const origin = request.headers.get("origin");
-  if (!origin) return;
+  if (!origin) throw new HttpError(403, "ORIGIN_REQUIRED", "A same-origin request is required");
   try {
-    if (new URL(origin).origin !== new URL(request.url).origin) {
+    const expected = process.env.POMERIUM_ROUTE_URL ? pomeriumRoute().origin : new URL(request.url).origin;
+    if (new URL(origin).origin !== expected) {
       throw new HttpError(403, "ORIGIN_FORBIDDEN", "Cross-origin mutations are not allowed");
     }
   } catch (error) {
@@ -90,24 +148,19 @@ export function assertSameOrigin(request: Request) {
   }
 }
 
-function rateLimitKey(request: Request) {
-  return (request.headers.get("x-forwarded-for")?.split(",", 1)[0] || "unknown").trim().slice(0, 128);
-}
-
-export function enforceMutationRateLimit(request: Request, now = Date.now()) {
+export function enforceMutationRateLimit(principal: string, now = Date.now()) {
   // ponytail: process-local limiter is enough for one Akash replica; use a shared store when scaling out.
   if (rateBuckets.size > 10_000) {
     for (const [key, bucket] of rateBuckets) if (bucket.resetAt <= now) rateBuckets.delete(key);
   }
-  const key = rateLimitKey(request);
-  const current = rateBuckets.get(key);
+  const current = rateBuckets.get(principal);
   if (!current || current.resetAt <= now) {
-    rateBuckets.set(key, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    rateBuckets.set(principal, { count: 1, resetAt: now + RATE_WINDOW_MS });
     return;
   }
   if (current.count >= RATE_LIMIT) {
     const retryAfter = Math.max(1, Math.ceil((current.resetAt - now) / 1_000));
-    throw new HttpError(429, "RATE_LIMITED", "Too many mission requests", { "Retry-After": String(retryAfter) });
+    throw new HttpError(429, "RATE_LIMITED", "Too many requests", { "Retry-After": String(retryAfter) });
   }
   current.count += 1;
 }

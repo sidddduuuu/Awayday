@@ -1,6 +1,7 @@
 import * as z from "zod";
 import {
   assertSameOrigin,
+  authenticatedSubject,
   dataResponse,
   enforceMutationRateLimit,
   handleApiError,
@@ -8,7 +9,7 @@ import {
   readJson,
 } from "../../../../../../../src/http.ts";
 import {
-  findMission,
+  findOwnedMission,
   missionDatabase,
   transitionActionStatus,
 } from "../../../../../../../src/missions/store.ts";
@@ -22,12 +23,13 @@ type RouteContext = { params: Promise<{ id: string; actionId: string }> };
 
 export async function POST(request: Request, { params }: RouteContext) {
   try {
+    const ownerId = await authenticatedSubject(request);
     assertSameOrigin(request);
-    enforceMutationRateLimit(request);
+    enforceMutationRateLimit(ownerId);
     const route = await params;
     const missionId = ResourceIdSchema.parse(route.id);
     const actionId = ResourceIdSchema.parse(route.actionId);
-    if (!findMission(missionDatabase(), missionId)) {
+    if (!findOwnedMission(missionDatabase(), missionId, ownerId)) {
       throw new HttpError(404, "MISSION_NOT_FOUND", "Mission not found");
     }
     const { decision } = DecisionSchema.parse(await readJson(request));
