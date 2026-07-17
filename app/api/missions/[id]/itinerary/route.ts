@@ -1,18 +1,12 @@
 import { assertSameOrigin, dataResponse, enforceMutationRateLimit, handleApiError, HttpError, readJson } from "../../../../../src/http.ts";
+import { currentTripState } from "../../../../../src/missions/disruptions.ts";
 import {
   findItinerary,
   findMission,
-  listDisruptions,
   missionDatabase,
   saveItinerary,
 } from "../../../../../src/missions/store.ts";
-import { evaluateReadiness } from "../../../../../src/trips/readiness.ts";
-import {
-  ItinerarySchema,
-  ResourceIdSchema,
-  type ItineraryLeg,
-  type Mission,
-} from "../../../../../src/trips/schemas.ts";
+import { ItinerarySchema, ResourceIdSchema } from "../../../../../src/trips/schemas.ts";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,20 +20,13 @@ async function loadMission({ params }: RouteContext) {
   return record.mission;
 }
 
-function assembly(mission: Mission, legs: ItineraryLeg[]) {
-  const legIds = new Set(legs.map(({ id }) => id));
-  const disruptions = listDisruptions(missionDatabase(), mission.id)
-    .map(({ disruption }) => disruption)
-    .filter(({ legId }) => legIds.has(legId));
-  return evaluateReadiness({ mission, legs, disruptions, evaluatedAt: new Date().toISOString() });
-}
-
 export async function GET(_request: Request, context: RouteContext) {
   try {
     const mission = await loadMission(context);
     const itinerary = findItinerary(missionDatabase(), mission.id);
     if (!itinerary) throw new HttpError(404, "ITINERARY_NOT_FOUND", "Itinerary not found");
-    return dataResponse({ itinerary, readiness: assembly(mission, itinerary.legs) });
+    const state = currentTripState(missionDatabase(), mission, itinerary.legs);
+    return dataResponse({ itinerary, readiness: state.readiness });
   } catch (error) {
     return handleApiError(error, "itinerary_read_failed");
   }
@@ -51,7 +38,7 @@ export async function PUT(request: Request, context: RouteContext) {
     enforceMutationRateLimit(request);
     const mission = await loadMission(context);
     const itineraryInput = ItinerarySchema.parse(await readJson(request));
-    const readiness = assembly(mission, itineraryInput.legs);
+    const readiness = currentTripState(missionDatabase(), mission, itineraryInput.legs).readiness;
     const itinerary = saveItinerary(missionDatabase(), mission.id, itineraryInput);
     return dataResponse({ itinerary, readiness });
   } catch (error) {

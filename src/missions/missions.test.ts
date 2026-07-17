@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GET as health } from "../../app/api/health/route.ts";
+import { POST as ingestNexlaDisruption } from "../../app/api/integrations/nexla/disruptions/route.ts";
 import { GET as getDisruptions, POST as createDisruption } from "../../app/api/missions/[id]/disruptions/route.ts";
 import { GET as getItinerary, PUT as putItinerary } from "../../app/api/missions/[id]/itinerary/route.ts";
 import { GET as getMission } from "../../app/api/missions/[id]/route.ts";
@@ -98,6 +99,18 @@ function disruptionRequest(missionId: string, body: string, ip: string) {
   return new Request(`http://localhost/api/missions/${missionId}/disruptions`, {
     method: "POST",
     headers: { "content-type": "application/json", origin: "http://localhost", "x-forwarded-for": ip },
+    body,
+  });
+}
+
+function nexlaRequest(body: string, key: string, ip: string) {
+  return new Request("http://localhost/api/integrations/nexla/disruptions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-awayday-ingest-key": key,
+      "x-forwarded-for": ip,
+    },
     body,
   });
 }
@@ -305,6 +318,48 @@ describe("mission API", () => {
       { params: Promise.resolve({ id: missionId }) },
     );
     assert.equal(invalid.status, 400);
+  });
+
+  it("rejects unconfigured and unauthenticated Nexla ingestion", async () => {
+    const previous = process.env.NEXLA_INGEST_KEY;
+    try {
+      delete process.env.NEXLA_INGEST_KEY;
+      const unconfigured = await ingestNexlaDisruption(nexlaRequest("{}", "unused", "nexla-unconfigured"));
+      assert.equal(unconfigured.status, 503);
+
+      process.env.NEXLA_INGEST_KEY = "test-only-nexla-ingest-key-000000000000";
+      const unauthorized = await ingestNexlaDisruption(nexlaRequest("{}", "wrong", "nexla-unauthorized"));
+      assert.equal(unauthorized.status, 401);
+    } finally {
+      if (previous === undefined) delete process.env.NEXLA_INGEST_KEY;
+      else process.env.NEXLA_INGEST_KEY = previous;
+    }
+  });
+
+  it("ingests a normalized Nexla record through the shared disruption path", async () => {
+    const previous = process.env.NEXLA_INGEST_KEY;
+    const key = "test-only-nexla-ingest-key-000000000000";
+    process.env.NEXLA_INGEST_KEY = key;
+    try {
+      const missionId = await createAssembledMission("nexla-live");
+      const disruption = disruptionInput("nexla-delay");
+      const body = JSON.stringify({ missionId, ...disruption });
+      const created = await ingestNexlaDisruption(nexlaRequest(body, key, "nexla-create"));
+      const createdBody = await payload<DisruptionResponse>(created);
+      assert.equal(created.status, 201);
+      assert.equal(createdBody.data.readiness.status, "at_risk");
+
+      const repeated = await ingestNexlaDisruption(nexlaRequest(body, key, "nexla-repeat"));
+      assert.equal(repeated.status, 200);
+
+      const invalid = await ingestNexlaDisruption(
+        nexlaRequest(JSON.stringify({ missionId, ...disruption, unexpected: true }), key, "nexla-invalid"),
+      );
+      assert.equal(invalid.status, 400);
+    } finally {
+      if (previous === undefined) delete process.env.NEXLA_INGEST_KEY;
+      else process.env.NEXLA_INGEST_KEY = previous;
+    }
   });
 
   it("returns a stable not-found error", async () => {

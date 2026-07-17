@@ -197,6 +197,8 @@ nexla env configure
 
 Use a temporary session token for development. Create a scoped service key only when an unattended data flow exists.
 
+Awayday receives normalized Nexla records at `POST /api/integrations/nexla/disruptions`. Configure a Universal REST API destination to send `missionId`, `id`, `legId`, `reportedAt`, and `impact`, with `X-Awayday-Ingest-Key` set to the same 32-byte-or-longer `NEXLA_INGEST_KEY` stored in the deployment environment. Nexla must be able to reach the deployed Akash route.
+
 ### Pomerium
 
 ```bash
