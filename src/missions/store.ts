@@ -1,10 +1,16 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { MissionSchema, type Mission } from "../trips/schemas.ts";
+import { ItinerarySchema, MissionSchema, type Itinerary, type Mission } from "../trips/schemas.ts";
 
 export interface MissionRecord {
   mission: Mission;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ItineraryRecord extends Itinerary {
+  missionId: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -31,6 +37,12 @@ export function openMissionDatabase(path: string) {
   database.exec(`
     CREATE TABLE IF NOT EXISTS missions (
       id TEXT PRIMARY KEY,
+      payload TEXT NOT NULL CHECK (json_valid(payload)),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS itineraries (
+      mission_id TEXT PRIMARY KEY REFERENCES missions(id) ON DELETE CASCADE,
       payload TEXT NOT NULL CHECK (json_valid(payload)),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -75,7 +87,43 @@ export function findMission(database: DatabaseSync, id: string): MissionRecord |
   };
 }
 
+export function saveItinerary(
+  database: DatabaseSync,
+  missionId: string,
+  itinerary: Itinerary,
+  now = new Date(),
+): ItineraryRecord {
+  const timestamp = now.toISOString();
+  database.prepare(`
+    INSERT INTO itineraries (mission_id, payload, created_at, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (mission_id) DO UPDATE SET
+      payload = excluded.payload,
+      updated_at = excluded.updated_at
+  `).run(missionId, JSON.stringify(itinerary), timestamp, timestamp);
+  const saved = findItinerary(database, missionId);
+  if (!saved) throw new Error("Saved itinerary could not be read");
+  return saved;
+}
+
+export function findItinerary(database: DatabaseSync, missionId: string): ItineraryRecord | null {
+  const row = database.prepare(`
+    SELECT payload, created_at, updated_at
+    FROM itineraries
+    WHERE mission_id = ?
+  `).get(missionId);
+  if (!row) return null;
+  if (typeof row.payload !== "string" || typeof row.created_at !== "string" || typeof row.updated_at !== "string") {
+    throw new Error("Stored itinerary row has an invalid shape");
+  }
+  return {
+    missionId,
+    ...ItinerarySchema.parse(JSON.parse(row.payload)),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export function databaseIsHealthy(database: DatabaseSync) {
   return database.prepare("SELECT 1 AS ok").get()?.ok === 1;
 }
-

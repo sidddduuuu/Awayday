@@ -84,6 +84,16 @@ export const ItineraryLegSchema = z
     if (!unique(leg.travelerIds)) {
       context.addIssue({ code: "custom", message: "Traveler IDs on a leg must be unique", path: ["travelerIds"] });
     }
+    const travelerIds = new Set(leg.travelerIds);
+    leg.cost.allocations.forEach(({ travelerId }, index) => {
+      if (!travelerIds.has(travelerId)) {
+        context.addIssue({
+          code: "custom",
+          message: "Cost allocations must belong to a traveler on the leg",
+          path: ["cost", "allocations", index, "travelerId"],
+        });
+      }
+    });
     if (Date.parse(leg.endsAt) <= Date.parse(leg.startsAt)) {
       context.addIssue({ code: "custom", message: "Leg end must be after its start", path: ["endsAt"] });
     }
@@ -109,6 +119,10 @@ export const ItineraryLegSchema = z
       context.addIssue({ code: "custom", message: "Only flight legs can contain stops", path: ["stops"] });
     }
   });
+
+export const ItinerarySchema = z.strictObject({
+  legs: z.array(ItineraryLegSchema).min(1).max(100),
+});
 
 export const DisruptionSchema = z.strictObject({
   id: ResourceIdSchema,
@@ -169,6 +183,7 @@ export type Mission = z.infer<typeof MissionSchema>;
 export type CreateMission = z.infer<typeof CreateMissionSchema>;
 export type Traveler = z.infer<typeof TravelerSchema>;
 export type ItineraryLeg = z.infer<typeof ItineraryLegSchema>;
+export type Itinerary = z.infer<typeof ItinerarySchema>;
 export type Disruption = z.infer<typeof DisruptionSchema>;
 export type Action = z.infer<typeof ActionSchema>;
 export type ReadinessInput = z.infer<typeof ReadinessInputSchema>;
