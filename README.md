@@ -171,6 +171,52 @@ The visual moment for a demo is a simulated disruption: the map turns amber/red,
 - **Infrastructure:** Akash for workers/services; secure secrets and scoped access through Pomerium
 - **Data and integrations:** Nexla for governed live data; Zero and curated providers for tool access
 
+## Sponsor tooling
+
+Keep sponsor credentials out of Git. Use short-lived development sessions where available and dedicated service credentials only when the deployed architecture needs them.
+
+### Zero
+
+```bash
+zero --version
+zero auth login
+zero auth whoami
+zero wallet balance
+```
+
+Zero provides dynamic capability discovery and invocation. Always inspect a capability before calling it and set an explicit `--max-pay` for paid calls.
+
+### Nexla
+
+Nexla's CLI package and access token are account-gated. Download the CLI from the Nexla console, install the downloaded package, then configure the environment:
+
+```bash
+pip3 install <downloaded-nexla-cli-package>
+nexla env configure
+```
+
+Use a temporary session token for development. Create a scoped service key only when an unattended data flow exists.
+
+### Pomerium
+
+```bash
+brew tap pomerium/tap
+brew install pomerium-cli
+pomerium-cli --version
+```
+
+Running the Pomerium gateway also requires Docker and a Pomerium Zero cluster token. Add its Compose configuration only after the protected Awayday service exists.
+
+### Akash
+
+```bash
+brew tap akash-network/tap
+brew install akash-provider-services
+provider-services version
+```
+
+Create and fund an Akash wallet only when the first deployable container exists; wallet creation emits a recovery phrase that must be stored securely.
+
 ## Name
 
 **Awayday** is the working name. Its core feature and promise is **Get Us There**.
